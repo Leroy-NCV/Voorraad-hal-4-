@@ -305,8 +305,13 @@ function condClass(c){
   return "cond-na";
 }
 
-function Toast({msg}){
-  return <div className={"toast" + (msg ? " show" : "")}>{msg}</div>;
+function Toast({msg, action}){
+  return (
+    <div className={"toast" + (msg ? " show" : "")} style={{display:'flex', alignItems:'center', gap:12, pointerEvents: action ? 'auto' : 'none'}}>
+      <span>{msg}</span>
+      {action && <button onClick={action.onClick} style={{all:'unset', cursor:'pointer', color:'#F0C48A', fontWeight:700, fontSize:12, textDecoration:'underline', pointerEvents:'auto'}}>{action.label}</button>}
+    </div>
+  );
 }
 
 function App(){
@@ -322,6 +327,12 @@ function App(){
   const [search, setSearch] = useState('');
   const [editId, setEditId] = useState(null);
   const [editDraft, setEditDraft] = useState(null);
+  const [mutateItem, setMutateItem] = useState(null);
+  const [detailMotor, setDetailMotor] = useState(null);
+  const [mutateMode, setMutateMode] = useState('uit');
+  const [mutateAmount, setMutateAmount] = useState(1);
+  const [mutateNote, setMutateNote] = useState('');
+  const [mutateDestination, setMutateDestination] = useState('');
   const [editTurboId, setEditTurboId] = useState(null);
   const [editTurboDraft, setEditTurboDraft] = useState(null);
 
@@ -334,9 +345,38 @@ function App(){
   const [newTurbotype, setNewTurbotype] = useState('');
   const [thresholdDraft, setThresholdDraft] = useState(DEFAULT_SETTINGS.lowStockThreshold);
 
-  const showToast = (msg) => {
+  const [gebruiker, setGebruiker] = useState(() => localStorage.getItem('voorraad_gebruikersnaam') || '');
+  const [naamInvoer, setNaamInvoer] = useState('');
+  const [history, setHistory] = useState([]);
+  const [uitgaven, setUitgaven] = useState([]);
+  const [uitgaveFilterMotor, setUitgaveFilterMotor] = useState('');
+  const [uitgaveFilterGebruiker, setUitgaveFilterGebruiker] = useState('');
+  const [uitgaveFilterVan, setUitgaveFilterVan] = useState('');
+  const [uitgaveFilterTot, setUitgaveFilterTot] = useState('');
+  const [uitgaveSearch, setUitgaveSearch] = useState('');
+  const [toastAction, setToastAction] = useState(null);
+  const [sortField, setSortField] = useState(null);
+  const [sortDir, setSortDir] = useState('asc');
+  const [sortFieldTurbo, setSortFieldTurbo] = useState(null);
+  const [sortDirTurbo, setSortDirTurbo] = useState('asc');
+
+  const showToast = (msg, action) => {
     setToast(msg);
-    setTimeout(()=>setToast(''), 2200);
+    setToastAction(action || null);
+    setTimeout(()=>{ setToast(''); setToastAction(null); }, action ? 15000 : 2200);
+  };
+
+  const saveNaam = () => {
+    const v = naamInvoer.trim();
+    if(!v) return;
+    localStorage.setItem('voorraad_gebruikersnaam', v);
+    setGebruiker(v);
+  };
+
+  const logHistory = async (entity, action, record_id, snapshot) => {
+    const entry = { id: uid(), entity, action, record_id, snapshot, gebruiker: gebruiker || 'Onbekend', created_at: new Date().toISOString() };
+    try{ await supabase.from('history').insert(entry); }catch(e){ /* geschiedenis loggen mag falen zonder de actie te blokkeren */ }
+    setHistory(h => [entry, ...h]);
   };
 
   const loadAll = useCallback(async () => {
@@ -354,6 +394,23 @@ function App(){
         aantal: t.aantal, conditie: t.conditie, opmerking: t.opmerking || '', updatedAt: t.updated_at
       })));
     }
+    const HISTORY_ACTIONS = ['toegevoegd','gewijzigd','verwijderd','hersteld'];
+    const UITGAVE_ACTIONS = ['uitgegeven','aangevuld'];
+
+    const { data: historyData, error: historyErr } = await supabase.from('history').select('*').in('action', HISTORY_ACTIONS).order('created_at', { ascending: false }).limit(500);
+    if(!historyErr && historyData){
+      setHistory(historyData);
+    }
+
+    const { data: uitgavenData, error: uitgavenErr } = await supabase.from('history').select('*').in('action', UITGAVE_ACTIONS).order('created_at', { ascending: false }).limit(5000);
+    if(!uitgavenErr && uitgavenData){
+      setUitgaven(uitgavenData);
+    }
+
+    // Geschiedenis (niet: uitgaven) ouder dan 60 dagen permanent opruimen
+    const cutoff = new Date(Date.now() - 60*24*60*60*1000).toISOString();
+    supabase.from('history').delete().in('action', HISTORY_ACTIONS).lt('created_at', cutoff).then(()=>{});
+
     const { data: settingsData, error: settingsErr } = await supabase.from('settings').select('*').eq('id', 1).single();
     if(!settingsErr && settingsData){
       const parsed = {
@@ -489,15 +546,31 @@ function App(){
     const { error } = await supabase.from('parts').insert(entry);
     if(error){ showToast('Opslaan mislukt: ' + error.message); return; }
     await persistParts([{...entry, updatedAt: entry.updated_at}, ...parts]);
+    logHistory('parts', 'toegevoegd', entry.id, entry);
     setForm({motortype: form.motortype, locatie:'', omschrijving:'', aantal:'', conditie:'N/A', opmerking:''});
     showToast('Onderdeel toegevoegd');
   };
 
+  const restorePart = async (snapshot) => {
+    const entry = {
+      id: snapshot.id, motortype: snapshot.motortype, locatie: snapshot.locatie,
+      omschrijving: snapshot.omschrijving, aantal: snapshot.aantal, conditie: snapshot.conditie,
+      opmerking: snapshot.opmerking || '', updated_at: new Date().toISOString()
+    };
+    const { error } = await supabase.from('parts').insert(entry);
+    if(error){ showToast('Herstellen mislukt: ' + error.message); return; }
+    await persistParts([{...entry, updatedAt: entry.updated_at}, ...parts.filter(p => p.id !== entry.id)]);
+    logHistory('parts', 'hersteld', entry.id, entry);
+    showToast('Onderdeel hersteld');
+  };
+
   const deletePart = async (id) => {
+    const item = parts.find(p => p.id === id);
     const { error } = await supabase.from('parts').delete().eq('id', id);
     if(error){ showToast('Verwijderen mislukt: ' + error.message); return; }
     await persistParts(parts.filter(p => p.id !== id));
-    showToast('Onderdeel verwijderd');
+    if(item) logHistory('parts', 'verwijderd', id, item);
+    showToast('Onderdeel verwijderd', item ? {label:'Ongedaan maken', onClick: () => restorePart(item)} : null);
   };
 
   const startEdit = (p) => {
@@ -506,6 +579,7 @@ function App(){
   };
 
   const saveEdit = async () => {
+    const before = parts.find(p => p.id === editId);
     const updated = {...editDraft, aantal: Number(editDraft.aantal), updatedAt: new Date().toISOString()};
     const { error } = await supabase.from('parts').update({
       motortype: updated.motortype, locatie: updated.locatie, omschrijving: updated.omschrijving,
@@ -515,12 +589,43 @@ function App(){
     if(error){ showToast('Bijwerken mislukt: ' + error.message); return; }
     const next = parts.map(p => p.id === editId ? updated : p);
     await persistParts(next);
+    logHistory('parts', 'gewijzigd', editId, {voor: before, na: updated});
     setEditId(null);
     setEditDraft(null);
     showToast('Wijziging opgeslagen');
   };
 
   const cancelEdit = () => { setEditId(null); setEditDraft(null); };
+
+  const openMutate = (item, mode) => {
+    setMutateItem(item);
+    setMutateMode(mode);
+    setMutateAmount(1);
+    setMutateNote('');
+    setMutateDestination('');
+  };
+
+  const cancelMutate = () => { setMutateItem(null); setMutateNote(''); setMutateDestination(''); };
+
+  const confirmMutate = async () => {
+    const amount = Number(mutateAmount);
+    if(!amount || amount <= 0){ showToast('Vul een aantal groter dan 0 in'); return; }
+    const item = mutateItem;
+    const delta = mutateMode === 'uit' ? -amount : amount;
+    const nieuwAantal = Math.max(0, item.aantal + delta);
+    const { error } = await supabase.from('parts').update({ aantal: nieuwAantal, updated_at: new Date().toISOString() }).eq('id', item.id);
+    if(error){ showToast('Muteren mislukt: ' + error.message); return; }
+    const next = parts.map(p => p.id === item.id ? {...p, aantal: nieuwAantal, updatedAt: new Date().toISOString()} : p);
+    await persistParts(next);
+    logHistory('parts', mutateMode === 'uit' ? 'uitgegeven' : 'aangevuld', item.id, {
+      motortype: item.motortype, locatie: item.locatie, omschrijving: item.omschrijving,
+      aantal: amount, van: item.aantal, naar: nieuwAantal, opmerking: mutateNote.trim(), bestemming: mutateDestination.trim()
+    });
+    showToast(mutateMode === 'uit' ? `${amount} stuks uitgegeven` : `${amount} stuks aangevuld`);
+    setMutateItem(null);
+    setMutateNote('');
+    setMutateDestination('');
+  };
 
   const addTurbo = async (e) => {
     e.preventDefault();
@@ -541,15 +646,31 @@ function App(){
     const { error } = await supabase.from('turbos').insert(entry);
     if(error){ showToast('Opslaan mislukt: ' + error.message); return; }
     await persistTurbos([{...entry, updatedAt: entry.updated_at}, ...turbos]);
+    logHistory('turbos', 'toegevoegd', entry.id, entry);
     setTurboForm({turbotype: turboForm.turbotype, locatie:'', omschrijving:'', aantal:'', conditie:'N/A', opmerking:''});
     showToast('Turbo toegevoegd');
   };
 
+  const restoreTurbo = async (snapshot) => {
+    const entry = {
+      id: snapshot.id, turbotype: snapshot.turbotype, locatie: snapshot.locatie,
+      omschrijving: snapshot.omschrijving, aantal: snapshot.aantal, conditie: snapshot.conditie,
+      opmerking: snapshot.opmerking || '', updated_at: new Date().toISOString()
+    };
+    const { error } = await supabase.from('turbos').insert(entry);
+    if(error){ showToast('Herstellen mislukt: ' + error.message); return; }
+    await persistTurbos([{...entry, updatedAt: entry.updated_at}, ...turbos.filter(t => t.id !== entry.id)]);
+    logHistory('turbos', 'hersteld', entry.id, entry);
+    showToast('Turbo hersteld');
+  };
+
   const deleteTurbo = async (id) => {
+    const item = turbos.find(t => t.id === id);
     const { error } = await supabase.from('turbos').delete().eq('id', id);
     if(error){ showToast('Verwijderen mislukt: ' + error.message); return; }
     await persistTurbos(turbos.filter(t => t.id !== id));
-    showToast('Turbo verwijderd');
+    if(item) logHistory('turbos', 'verwijderd', id, item);
+    showToast('Turbo verwijderd', item ? {label:'Ongedaan maken', onClick: () => restoreTurbo(item)} : null);
   };
 
   const startEditTurbo = (t) => {
@@ -558,6 +679,7 @@ function App(){
   };
 
   const saveEditTurbo = async () => {
+    const before = turbos.find(t => t.id === editTurboId);
     const updated = {...editTurboDraft, aantal: Number(editTurboDraft.aantal), updatedAt: new Date().toISOString()};
     const { error } = await supabase.from('turbos').update({
       turbotype: updated.turbotype, locatie: updated.locatie, omschrijving: updated.omschrijving,
@@ -567,6 +689,7 @@ function App(){
     if(error){ showToast('Bijwerken mislukt: ' + error.message); return; }
     const next = turbos.map(t => t.id === editTurboId ? updated : t);
     await persistTurbos(next);
+    logHistory('turbos', 'gewijzigd', editTurboId, {voor: before, na: updated});
     setEditTurboId(null);
     setEditTurboDraft(null);
     showToast('Wijziging opgeslagen');
@@ -623,19 +746,71 @@ function App(){
     return <div className="app"><div className="main"><div className="loading">Voorraad wordt geladen…</div></div></div>;
   }
 
-  const filtered = parts.filter(p => {
+  if(!gebruiker){
+    return (
+      <div className="app" style={{alignItems:'center', justifyContent:'center', minHeight:400}}>
+        <div className="card" style={{maxWidth:340, textAlign:'center'}}>
+          <div style={{fontFamily:'Oswald,sans-serif', fontWeight:700, fontSize:18, marginBottom:6}}>Welkom</div>
+          <p style={{fontSize:13, color:'#7A8390', marginBottom:14}}>Vul je naam in zodat wijzigingen aan je toegeschreven kunnen worden in de geschiedenis.</p>
+          <input type="text" placeholder="Jouw naam" value={naamInvoer} onChange={e=>setNaamInvoer(e.target.value)} onKeyDown={e=>{if(e.key==='Enter') saveNaam();}} style={{width:'100%', marginBottom:10}} />
+          <button className="btn btn-primary" style={{width:'100%'}} onClick={saveNaam}>Doorgaan</button>
+        </div>
+      </div>
+    );
+  }
+
+  const sortRows = (rows, field, dir) => {
+    if(!field) return rows;
+    const sorted = [...rows].sort((a,b) => {
+      let av = a[field], bv = b[field];
+      if(typeof av === 'string') av = av.toLowerCase();
+      if(typeof bv === 'string') bv = bv.toLowerCase();
+      if(av < bv) return -1;
+      if(av > bv) return 1;
+      return 0;
+    });
+    return dir === 'desc' ? sorted.reverse() : sorted;
+  };
+
+  const toggleSort = (field) => {
+    if(sortField === field){ setSortDir(sortDir === 'asc' ? 'desc' : 'asc'); }
+    else { setSortField(field); setSortDir('asc'); }
+  };
+
+  const toggleSortTurbo = (field) => {
+    if(sortFieldTurbo === field){ setSortDirTurbo(sortDirTurbo === 'asc' ? 'desc' : 'asc'); }
+    else { setSortFieldTurbo(field); setSortDirTurbo('asc'); }
+  };
+
+  const sortArrow = (field, curField, curDir) => curField === field ? (curDir === 'asc' ? ' ▲' : ' ▼') : '';
+
+  const exportToExcel = (rows, typeLabel, typeField) => {
+    if(rows.length === 0){ showToast('Niets om te exporteren'); return; }
+    const data = rows.map(r => ({
+      [typeLabel]: r[typeField], Locatie: r.locatie, Omschrijving: r.omschrijving,
+      Aantal: r.aantal, Conditie: r.conditie, Opmerking: r.opmerking || ''
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wbook, ws, 'Voorraad');
+    const datum = new Date().toISOString().slice(0,10);
+    XLSX.writeFile(wbook, `voorraad-${typeField}-${datum}.xlsx`);
+    showToast('Excel-bestand gedownload');
+  };
+
+  const filtered = sortRows(parts.filter(p => {
     const matchMotor = !filterMotor || p.motortype === filterMotor;
     const q = search.trim().toLowerCase();
     const matchSearch = !q || p.omschrijving.toLowerCase().includes(q) || p.locatie.toLowerCase().includes(q) || p.motortype.toLowerCase().includes(q);
     return matchMotor && matchSearch;
-  });
+  }), sortField, sortDir);
 
-  const filteredTurbos = turbos.filter(t => {
+  const filteredTurbos = sortRows(turbos.filter(t => {
     const matchTurbo = !filterTurbo || t.turbotype === filterTurbo;
     const q = searchTurbo.trim().toLowerCase();
     const matchSearch = !q || t.omschrijving.toLowerCase().includes(q) || t.locatie.toLowerCase().includes(q) || t.turbotype.toLowerCase().includes(q);
     return matchTurbo && matchSearch;
-  });
+  }), sortFieldTurbo, sortDirTurbo);
 
   const byMotor = {};
   parts.forEach(p => {
@@ -660,8 +835,9 @@ function App(){
           <div className="brand-title">Motorvoorraad</div>
         </div>
         <button className={"nav-btn" + (tab==='dashboard'?' active':'')} onClick={()=>setTab('dashboard')}>Dashboard</button>
-        <button className={"nav-btn" + (tab==='voorraad'?' active':'')} onClick={()=>setTab('voorraad')}>Voorraad</button>
-        <button className={"nav-btn" + (tab==='turbos'?' active':'')} onClick={()=>setTab('turbos')}>Turbos</button>
+        <button className={"nav-btn" + (tab==='voorraad'?' active':'')} onClick={()=>setTab('voorraad')}>Voorraad invoer</button>
+        <button className={"nav-btn" + (tab==='geschiedenis'?' active':'')} onClick={()=>setTab('geschiedenis')}>Geschiedenis</button>
+        <button className={"nav-btn" + (tab==='uitgaven'?' active':'')} onClick={()=>setTab('uitgaven')}>Uitgaven</button>
         <button className={"nav-btn" + (tab==='instellingen'?' active':'')} onClick={()=>setTab('instellingen')}>Instellingen</button>
         <div style={{marginTop:'auto', paddingTop:14, borderTop:'1px solid rgba(255,255,255,0.12)'}}>
           <button className="nav-btn" onClick={async ()=>{ await loadAll(); showToast('Bijgewerkt'); }}>↻ Vernieuwen</button>
@@ -698,7 +874,7 @@ function App(){
               {settings.motortypes.map(mt => {
                 const d = byMotor[mt] || {count:0,total:0,low:false};
                 return (
-                  <div key={mt} className={"stat-card" + (d.low?" low":"")} onClick={()=>{setFilterMotor(mt); setTab('voorraad');}} style={{cursor:'pointer'}}>
+                  <div key={mt} className={"stat-card" + (d.low?" low":"")} onClick={()=>setDetailMotor(mt)} style={{cursor:'pointer'}}>
                     <div className="stat-motor">{mt}</div>
                     <div className="stat-count">{d.total}</div>
                     <div className="stat-label">{d.count} regel{d.count===1?'':'s'}</div>
@@ -706,19 +882,13 @@ function App(){
                   </div>
                 );
               })}
-              <div className={"stat-card" + (lowStockTurboRows.length > 0 ? " low" : "")} onClick={()=>setTab('turbos')} style={{cursor:'pointer'}}>
-                <div className="stat-motor">Turbo's</div>
-                <div className="stat-count">{totalTurboUnits}</div>
-                <div className="stat-label">{totalTurbos} regel{totalTurbos===1?'':'s'}</div>
-                {lowStockTurboRows.length > 0 && <div className="badge-low">Lage voorraad</div>}
-              </div>
             </div>
           </div>
         )}
 
         {tab === 'voorraad' && (
           <div>
-            <h1 className="page-title">Voorraad</h1>
+            <h1 className="page-title">Voorraad invoer</h1>
             <p className="page-sub">Nieuw onderdeel toevoegen en bestaande voorraad beheren</p>
 
             <div className="card" style={{marginBottom:20, borderLeft:'4px solid var(--steel)'}}>
@@ -781,6 +951,7 @@ function App(){
               </select>
               <input type="text" placeholder="Zoeken op omschrijving, locatie of type..." value={search} onChange={e=>setSearch(e.target.value)} style={{minWidth:260}} />
               {filterMotor && <button className="btn btn-ghost btn-sm" onClick={()=>setFilterMotor('')}>Filter wissen</button>}
+              <button className="btn btn-ghost btn-sm" onClick={()=>exportToExcel(filtered, 'Motortype', 'motortype')}>⬇ Exporteren naar Excel</button>
               <span style={{marginLeft:'auto', fontSize:12, color:'#7A8390'}}>{filtered.length} van {parts.length} regels</span>
             </div>
 
@@ -794,7 +965,11 @@ function App(){
                 <table>
                   <thead>
                     <tr>
-                      <th>Motortype</th><th>Locatie</th><th>Omschrijving</th><th>Aantal</th><th>Conditie</th><th>Opmerking</th><th></th>
+                      <th>Motortype</th>
+                      <th style={{cursor:'pointer'}} onClick={()=>toggleSort('locatie')}>Locatie{sortArrow('locatie', sortField, sortDir)}</th>
+                      <th style={{cursor:'pointer'}} onClick={()=>toggleSort('omschrijving')}>Omschrijving{sortArrow('omschrijving', sortField, sortDir)}</th>
+                      <th style={{cursor:'pointer'}} onClick={()=>toggleSort('aantal')}>Aantal{sortArrow('aantal', sortField, sortDir)}</th>
+                      <th>Conditie</th><th>Opmerking</th><th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -828,6 +1003,8 @@ function App(){
                         <td><span className={"cond-pill " + condClass(p.conditie)}>{p.conditie}</span></td>
                         <td style={{color:'#7A8390'}}>{p.opmerking || '—'}</td>
                         <td style={{whiteSpace:'nowrap'}}>
+                          <button className="btn btn-primary btn-sm" onClick={()=>openMutate(p, 'uit')} style={{marginRight:6}}>− Uitgeven</button>
+                          <button className="btn btn-ghost btn-sm" onClick={()=>openMutate(p, 'aan')} style={{marginRight:6}}>+ Aanvullen</button>
                           <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(p)} style={{marginRight:6}}>Bewerken</button>
                           <button className="btn btn-danger btn-sm" onClick={()=>deletePart(p.id)}>Verwijderen</button>
                         </td>
@@ -840,131 +1017,117 @@ function App(){
           </div>
         )}
 
-        {tab === 'turbos' && (
+        {tab === 'geschiedenis' && (
           <div>
-            <h1 className="page-title">Turbos</h1>
-            <p className="page-sub">{totalTurbos} turbo's · {totalTurboUnits} stuks totaal</p>
-
-            {lowStockTurboRows.length > 0 && (
-              <div className="card" style={{borderLeft:'4px solid var(--rust)', marginBottom:20}}>
-                <strong style={{color:'var(--rust)'}}>Lage voorraad turbo's</strong>
-                <span style={{fontSize:12, color:'#7A8390'}}> — onder de {settings.lowStockThreshold} stuks</span>
-                <table style={{marginTop:10}}>
-                  <thead><tr><th>Turbotype</th><th>Locatie</th><th>Omschrijving</th><th>Aantal</th></tr></thead>
-                  <tbody>
-                    {lowStockTurboRows.map(t => (
-                      <tr key={t.id}>
-                        <td><span className="pill">{t.turbotype}</span></td>
-                        <td>{t.locatie}</td>
-                        <td>{t.omschrijving}</td>
-                        <td style={{color:'var(--rust)', fontWeight:600}}>{t.aantal}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            <form onSubmit={addTurbo} className="card" style={{marginBottom:20}}>
-              <div className="form-grid">
-                <div>
-                  <label>Turbotype</label>
-                  {settings.turbotypes.length > 0 ? (
-                    <select value={turboForm.turbotype} onChange={e=>setTurboForm({...turboForm, turbotype:e.target.value})} style={{width:'100%'}}>
-                      <option value="">Kies...</option>
-                      {settings.turbotypes.map(tt => <option key={tt} value={tt}>{tt}</option>)}
-                    </select>
-                  ) : (
-                    <input type="text" value={turboForm.turbotype} onChange={e=>setTurboForm({...turboForm, turbotype:e.target.value})} style={{width:'100%'}} placeholder="bv. TD04" />
-                  )}
-                </div>
-                <div>
-                  <label>Locatie</label>
-                  <input type="text" value={turboForm.locatie} onChange={e=>setTurboForm({...turboForm, locatie:e.target.value})} style={{width:'100%'}} placeholder="bv. C-03-2" />
-                </div>
-                <div style={{gridColumn:'span 2'}}>
-                  <label>Omschrijving</label>
-                  <input type="text" value={turboForm.omschrijving} onChange={e=>setTurboForm({...turboForm, omschrijving:e.target.value})} style={{width:'100%'}} placeholder="bv. Turbo compleet" />
-                </div>
-                <div>
-                  <label>Aantal</label>
-                  <input type="number" min="0" value={turboForm.aantal} onChange={e=>setTurboForm({...turboForm, aantal:e.target.value})} style={{width:'100%'}} />
-                </div>
-                <div>
-                  <label>Conditie</label>
-                  <select value={turboForm.conditie} onChange={e=>setTurboForm({...turboForm, conditie:e.target.value})} style={{width:'100%'}}>
-                    {settings.condities.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-                <div style={{gridColumn:'span 5'}}>
-                  <label>Opmerking</label>
-                  <input type="text" value={turboForm.opmerking} onChange={e=>setTurboForm({...turboForm, opmerking:e.target.value})} style={{width:'100%'}} placeholder="optioneel" />
-                </div>
-                <div style={{display:'flex', alignItems:'flex-end'}}>
-                  <button className="btn btn-primary" type="submit" style={{width:'100%'}}>Toevoegen</button>
-                </div>
-              </div>
-            </form>
-
-            <div className="toolbar">
-              <select value={filterTurbo} onChange={e=>setFilterTurbo(e.target.value)}>
-                <option value="">Alle turbotypes</option>
-                {settings.turbotypes.map(tt => <option key={tt} value={tt}>{tt}</option>)}
-              </select>
-              <input type="text" placeholder="Zoeken op omschrijving, locatie of type..." value={searchTurbo} onChange={e=>setSearchTurbo(e.target.value)} style={{minWidth:260}} />
-              {filterTurbo && <button className="btn btn-ghost btn-sm" onClick={()=>setFilterTurbo('')}>Filter wissen</button>}
-              <span style={{marginLeft:'auto', fontSize:12, color:'#7A8390'}}>{filteredTurbos.length} van {turbos.length} regels</span>
-            </div>
+            <h1 className="page-title">Geschiedenis</h1>
+            <p className="page-sub">Toevoegingen, wijzigingen en verwijderingen — laatste 60 dagen, daarna automatisch opgeruimd. Uitgaven/aanvullingen vind je permanent onder "Uitgaven".</p>
 
             <div className="card" style={{padding:0, overflowX:'auto'}}>
-              {filteredTurbos.length === 0 ? (
+              {history.length === 0 ? (
                 <div className="empty-state">
-                  <div className="em-title">Geen turbo's gevonden</div>
-                  <div>Voeg hierboven een turbo toe of pas je filter aan.</div>
+                  <div className="em-title">Nog geen wijzigingen gelogd</div>
+                  <div>Zodra iemand iets toevoegt, wijzigt of verwijdert, verschijnt dat hier.</div>
                 </div>
               ) : (
                 <table>
                   <thead>
-                    <tr>
-                      <th>Turbotype</th><th>Locatie</th><th>Omschrijving</th><th>Aantal</th><th>Conditie</th><th>Opmerking</th><th></th>
-                    </tr>
+                    <tr><th>Wanneer</th><th>Gebruiker</th><th>Actie</th><th>Categorie</th><th>Wat</th><th></th></tr>
                   </thead>
                   <tbody>
-                    {filteredTurbos.map(t => editTurboId === t.id ? (
-                      <tr key={t.id} className="edit-row">
-                        <td><input type="text" value={editTurboDraft.turbotype} onChange={e=>setEditTurboDraft({...editTurboDraft, turbotype:e.target.value})} /></td>
-                        <td><input type="text" value={editTurboDraft.locatie} onChange={e=>setEditTurboDraft({...editTurboDraft, locatie:e.target.value})} /></td>
-                        <td><input type="text" value={editTurboDraft.omschrijving} onChange={e=>setEditTurboDraft({...editTurboDraft, omschrijving:e.target.value})} /></td>
-                        <td><input type="number" value={editTurboDraft.aantal} onChange={e=>setEditTurboDraft({...editTurboDraft, aantal:e.target.value})} /></td>
-                        <td>
-                          <select value={editTurboDraft.conditie} onChange={e=>setEditTurboDraft({...editTurboDraft, conditie:e.target.value})}>
-                            {settings.condities.map(c => <option key={c} value={c}>{c}</option>)}
-                          </select>
-                        </td>
-                        <td><input type="text" value={editTurboDraft.opmerking} onChange={e=>setEditTurboDraft({...editTurboDraft, opmerking:e.target.value})} /></td>
-                        <td style={{whiteSpace:'nowrap'}}>
-                          <button className="btn btn-primary btn-sm" onClick={saveEditTurbo} style={{marginRight:6}}>Opslaan</button>
-                          <button className="btn btn-ghost btn-sm" onClick={cancelEditTurbo}>Annuleren</button>
-                        </td>
-                      </tr>
-                    ) : (
-                      <tr key={t.id}>
-                        <td><span className="pill">{t.turbotype}</span></td>
-                        <td>{t.locatie}</td>
-                        <td>{t.omschrijving}</td>
-                        <td style={{fontWeight:600, color: t.aantal < settings.lowStockThreshold ? 'var(--rust)' : 'inherit'}}>{t.aantal}</td>
-                        <td><span className={"cond-pill " + condClass(t.conditie)}>{t.conditie}</span></td>
-                        <td style={{color:'#7A8390'}}>{t.opmerking || '—'}</td>
-                        <td style={{whiteSpace:'nowrap'}}>
-                          <button className="btn btn-ghost btn-sm" onClick={()=>startEditTurbo(t)} style={{marginRight:6}}>Bewerken</button>
-                          <button className="btn btn-danger btn-sm" onClick={()=>deleteTurbo(t.id)}>Verwijderen</button>
-                        </td>
-                      </tr>
-                    ))}
+                    {history.map(h => {
+                      const label = h.entity === 'parts' ? (h.snapshot.motortype || (h.snapshot.na && h.snapshot.na.motortype) || (h.snapshot.voor && h.snapshot.voor.motortype)) : (h.snapshot.turbotype || (h.snapshot.na && h.snapshot.na.turbotype) || (h.snapshot.voor && h.snapshot.voor.turbotype));
+                      const omschr = h.action === 'gewijzigd' ? (h.snapshot.na && h.snapshot.na.omschrijving) : h.snapshot.omschrijving;
+                      const when = new Date(h.created_at).toLocaleString('nl-NL', {day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit'});
+                      return (
+                        <tr key={h.id}>
+                          <td style={{whiteSpace:'nowrap', fontSize:12, color:'#7A8390'}}>{when}</td>
+                          <td>{h.gebruiker}</td>
+                          <td>
+                            <span className={"cond-pill " + (h.action === 'verwijderd' ? 'cond-na' : h.action === 'toegevoegd' ? 'cond-good' : 'cond-mid')}>{h.action}</span>
+                          </td>
+                          <td><span className="pill">{h.entity === 'parts' ? 'Voorraad' : 'Turbo'}</span></td>
+                          <td>{label} — {omschr}</td>
+                          <td>
+                            {h.action === 'verwijderd' && (
+                              <button className="btn btn-ghost btn-sm" onClick={()=> h.entity === 'parts' ? restorePart(h.snapshot) : restoreTurbo(h.snapshot)}>Herstellen</button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
             </div>
+          </div>
+        )}
+
+        {tab === 'uitgaven' && (
+          <div>
+            <h1 className="page-title">Uitgaven</h1>
+            <p className="page-sub">Alle uitgegeven en aangevulde stuks — permanent bewaard, {uitgaven.length} regels</p>
+
+            <div className="toolbar">
+              <select value={uitgaveFilterMotor} onChange={e=>setUitgaveFilterMotor(e.target.value)}>
+                <option value="">Alle motortypes</option>
+                {settings.motortypes.map(mt => <option key={mt} value={mt}>{mt}</option>)}
+              </select>
+              <select value={uitgaveFilterGebruiker} onChange={e=>setUitgaveFilterGebruiker(e.target.value)}>
+                <option value="">Alle gebruikers</option>
+                {[...new Set(uitgaven.map(u => u.gebruiker))].sort().map(g => <option key={g} value={g}>{g}</option>)}
+              </select>
+              <label style={{fontSize:12, color:'#7A8390'}}>Van <input type="date" value={uitgaveFilterVan} onChange={e=>setUitgaveFilterVan(e.target.value)} /></label>
+              <label style={{fontSize:12, color:'#7A8390'}}>Tot <input type="date" value={uitgaveFilterTot} onChange={e=>setUitgaveFilterTot(e.target.value)} /></label>
+              <input type="text" placeholder="Zoeken op omschrijving of bestemming..." value={uitgaveSearch} onChange={e=>setUitgaveSearch(e.target.value)} style={{minWidth:220}} />
+            </div>
+
+            {(() => {
+              const filteredUitgaven = uitgaven.filter(u => {
+                const motor = u.snapshot.motortype;
+                const matchMotor = !uitgaveFilterMotor || motor === uitgaveFilterMotor;
+                const matchGebruiker = !uitgaveFilterGebruiker || u.gebruiker === uitgaveFilterGebruiker;
+                const d = new Date(u.created_at);
+                const matchVan = !uitgaveFilterVan || d >= new Date(uitgaveFilterVan);
+                const matchTot = !uitgaveFilterTot || d <= new Date(uitgaveFilterTot + 'T23:59:59');
+                const q = uitgaveSearch.trim().toLowerCase();
+                const matchSearch = !q || (u.snapshot.omschrijving||'').toLowerCase().includes(q) || (u.snapshot.bestemming||'').toLowerCase().includes(q);
+                return matchMotor && matchGebruiker && matchVan && matchTot && matchSearch;
+              });
+              return (
+                <div className="card" style={{padding:0, overflowX:'auto'}}>
+                  {filteredUitgaven.length === 0 ? (
+                    <div className="empty-state">
+                      <div className="em-title">Geen uitgaven gevonden</div>
+                      <div>Zodra iemand iets uitgeeft of aanvult via Voorraad invoer, verschijnt dat hier.</div>
+                    </div>
+                  ) : (
+                    <table>
+                      <thead>
+                        <tr><th>Wanneer</th><th>Gebruiker</th><th>Actie</th><th>Motortype</th><th>Omschrijving</th><th>Aantal</th><th>Van → Naar</th><th>Bestemming</th><th>Reden</th></tr>
+                      </thead>
+                      <tbody>
+                        {filteredUitgaven.map(u => {
+                          const when = new Date(u.created_at).toLocaleString('nl-NL', {day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit'});
+                          return (
+                            <tr key={u.id}>
+                              <td style={{whiteSpace:'nowrap', fontSize:12, color:'#7A8390'}}>{when}</td>
+                              <td>{u.gebruiker}</td>
+                              <td><span className={"cond-pill " + (u.action === 'uitgegeven' ? 'cond-mid' : 'cond-good')}>{u.action}</span></td>
+                              <td><span className="pill">{u.snapshot.motortype}</span></td>
+                              <td>{u.snapshot.omschrijving}</td>
+                              <td style={{fontWeight:600}}>{u.snapshot.aantal}</td>
+                              <td style={{fontSize:12, color:'#7A8390'}}>{u.snapshot.van} → {u.snapshot.naar}</td>
+                              <td>{u.snapshot.bestemming || '—'}</td>
+                              <td style={{color:'#7A8390'}}>{u.snapshot.opmerking || '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -1024,7 +1187,72 @@ function App(){
           </div>
         )}
       </div>
-      <Toast msg={toast} />
+      {detailMotor && (
+        <div style={{position:'fixed', inset:0, background:'rgba(43,47,54,0.5)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:40}} onClick={()=>setDetailMotor(null)}>
+          <div className="card" style={{width:520, maxWidth:'90vw', maxHeight:'80vh', overflowY:'auto', background:'#fff'}} onClick={e=>e.stopPropagation()}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12}}>
+              <div style={{fontFamily:'Oswald,sans-serif', fontWeight:700, fontSize:18}}>{detailMotor}</div>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setDetailMotor(null)}>Sluiten</button>
+            </div>
+            {parts.filter(p => p.motortype === detailMotor).length === 0 ? (
+              <div className="empty-state" style={{padding:20}}>
+                <div className="em-title">Geen onderdelen</div>
+                <div>Er staat nog niets geregistreerd voor dit motortype.</div>
+              </div>
+            ) : (
+              <table>
+                <thead><tr><th>Locatie</th><th>Omschrijving</th><th>Aantal</th><th>Conditie</th></tr></thead>
+                <tbody>
+                  {parts.filter(p => p.motortype === detailMotor).map(p => (
+                    <tr key={p.id}>
+                      <td>{p.locatie}</td>
+                      <td>{p.omschrijving}</td>
+                      <td style={{fontWeight:600, color: p.aantal < settings.lowStockThreshold ? 'var(--rust)' : 'inherit'}}>{p.aantal}</td>
+                      <td><span className={"cond-pill " + condClass(p.conditie)}>{p.conditie}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {mutateItem && (
+        <div style={{position:'fixed', inset:0, background:'rgba(43,47,54,0.5)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:40}}>
+          <div className="card" style={{width:320, background:'#fff'}}>
+            <div style={{fontFamily:'Oswald,sans-serif', fontWeight:700, fontSize:16, marginBottom:4}}>
+              {mutateMode === 'uit' ? 'Uitgeven' : 'Aanvullen'}
+            </div>
+            <div style={{fontSize:12, color:'#7A8390', marginBottom:14}}>
+              {mutateItem.motortype} — {mutateItem.omschrijving} · huidig aantal: <strong>{mutateItem.aantal}</strong>
+            </div>
+            <div style={{display:'flex', gap:8, marginBottom:10}}>
+              <button className={"btn btn-sm " + (mutateMode==='uit' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMutateMode('uit')} style={{flex:1}}>− Uitgeven</button>
+              <button className={"btn btn-sm " + (mutateMode==='aan' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMutateMode('aan')} style={{flex:1}}>+ Aanvullen</button>
+            </div>
+            <label style={{fontSize:10.5, textTransform:'uppercase', letterSpacing:'0.4px', color:'#7A8390', display:'block', marginBottom:4, fontWeight:600}}>Aantal</label>
+            <input type="number" min="1" max={mutateMode==='uit' ? mutateItem.aantal : undefined} value={mutateAmount} onChange={e=>setMutateAmount(e.target.value)} style={{width:'100%', marginBottom:10}} autoFocus />
+            <label style={{fontSize:10.5, textTransform:'uppercase', letterSpacing:'0.4px', color:'#7A8390', display:'block', marginBottom:4, fontWeight:600}}>Reden / opmerking (optioneel)</label>
+            <input type="text" placeholder="bv. gebruikt voor project X" value={mutateNote} onChange={e=>setMutateNote(e.target.value)} style={{width:'100%', marginBottom:10}} />
+            {mutateMode === 'uit' && (
+              <React.Fragment>
+                <label style={{fontSize:10.5, textTransform:'uppercase', letterSpacing:'0.4px', color:'#7A8390', display:'block', marginBottom:4, fontWeight:600}}>Bestemming (waar gaat het naartoe?)</label>
+                <input type="text" placeholder="bv. klant Jansen / werkplaats hal 2" value={mutateDestination} onChange={e=>setMutateDestination(e.target.value)} style={{width:'100%', marginBottom:14}} />
+              </React.Fragment>
+            )}
+            {mutateMode === 'uit' && Number(mutateAmount) > mutateItem.aantal && (
+              <div style={{fontSize:12, color:'var(--rust)', marginBottom:10}}>Let op: dit is meer dan er in voorraad is, aantal wordt op 0 gezet.</div>
+            )}
+            <div style={{display:'flex', gap:8}}>
+              <button className="btn btn-primary" onClick={confirmMutate} style={{flex:1}}>Bevestigen</button>
+              <button className="btn btn-ghost" onClick={cancelMutate} style={{flex:1}}>Annuleren</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Toast msg={toast} action={toastAction} />
     </div>
   );
 }
